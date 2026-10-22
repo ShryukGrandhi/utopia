@@ -236,7 +236,57 @@ pub async fn put_transcribe(
     Ok(Json(json!({ "ok": true, "requeued": requeued })))
 }
 
-/// 连通性测试：对话发一条最小消息；embedding 试算一条并返回维度；版面识别服务问一声健康。
+/// 对话模型按任务真用的请求形状各问一次（#1354）。从前只发一句非流式、不带上限、温度、
+/// 工具的 chat，端点拒掉其中哪一样都照样「已连通」：rc9 上测试过了，抽取却每块都挂在
+/// `max_tokens` 和 `temperature` 上；拒绝工具的端点（#1353）对话只会悄悄退回一步检索。
+///
+/// 纯 chat 不通就只报它：密钥错、地址错时后两次也是同一句错，重复三遍没有信息。
+/// 通了再问另两种，各报各的。三次都只要一个词，托管模型上花不了几个 token
+async fn probe_chat(client: &utopia_llm::LlmClient) -> serde_json::Value {
+    let msg = [ChatMessage {
+        role: "user".into(),
+        content: "Reply with exactly one word: OK".into(),
+    }];
+    let reply = match client.chat(&msg).await {
+        Ok(reply) => reply,
+        Err(e) => return json!({ "ok": false, "error": e.to_string() }),
+    };
+    // 抽取那条路的形状：流式、带补全上限、温度 0（`chat_retrying_rate_limits_at`）
+    let streaming = client.chat_at_streaming(&msg, Some(0.0)).await.err();
+    // 对话与治理带工具；工具不必真被调用，端点收下这个字段就算过
+    let ping = json!([{
+        "type": "function",
+        "function": {
+            "name": "ping",
+            "description": "Connectivity check. Never needs to be called.",
+            "parameters": { "type": "object", "properties": {} },
+        },
+    }]);
+    let tools = client
+        .chat_tools(
+            &[json!({ "role": "user", "content": msg[0].content })],
+            &ping,
+        )
+        .await
+        .err();
+    if streaming.is_none() && tools.is_none() {
+        return json!({ "ok": true, "reply": reply.chars().take(50).collect::<String>() });
+    }
+    let outcome = |what: &str, err: Option<anyhow::Error>| match err {
+        None => format!("{what} ok"),
+        Some(e) => format!("{what} refused: {e}"),
+    };
+    json!({
+        "ok": false,
+        "error": format!(
+            "chat ok; {}; {}",
+            outcome("streaming", streaming),
+            outcome("tools", tools)
+        ),
+    })
+}
+
+/// 连通性测试：对话按任务的三种请求形状各问一次（见 [`probe_chat`]）；embedding 试算一条并返回维度；版面识别服务问一声健康。
 pub async fn test(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -254,18 +304,7 @@ pub async fn test(
 
     let chat_result = match llm_util::chat_client(&s) {
         None => json!({ "ok": false, "error": "Not configured" }),
-        Some(client) => {
-            let msg = [ChatMessage {
-                role: "user".into(),
-                content: "Reply with exactly one word: OK".into(),
-            }];
-            match client.chat(&msg).await {
-                Ok(reply) => {
-                    json!({ "ok": true, "reply": reply.chars().take(50).collect::<String>() })
-                }
-                Err(e) => json!({ "ok": false, "error": e.to_string() }),
-            }
-        }
+        Some(client) => probe_chat(&client).await,
     };
 
     let embed_result = match llm_util::embed_client(&s) {
@@ -300,3 +339,7 @@ pub async fn test(
         "transcribe": transcribe_result,
     })))
 }
+
+#[cfg(test)]
+#[path = "settings_routes_tests.rs"]
+mod tests;
