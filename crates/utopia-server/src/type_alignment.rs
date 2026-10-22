@@ -63,6 +63,7 @@ async fn candidates_for(
     .await
     {
         Ok(nearest) => nearest,
+        Err(e) if utopia_llm::out_of_credit(&e).is_some() => return Err(e),
         Err(e) => {
             tracing::warn!(%kb_id, error = %e, "类别词对齐检索候选类失败，退回整表");
             Vec::new()
@@ -294,6 +295,8 @@ async fn align_types_locked(
                     .await
                 {
                     Ok(r) => r,
+                    // 欠费让整轮失败一次、告警响起，不按 failed 记了再排（同短语对齐，#1360）
+                    Err(e) if utopia_llm::out_of_credit(&e).is_some() => return Err(e),
                     Err(e) => {
                         tracing::warn!(%kb_id, error = %e, "类别词对齐调用失败，这一批留到下次");
                         failed += 1;
