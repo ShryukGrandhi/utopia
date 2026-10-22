@@ -66,6 +66,9 @@ struct Config {
     /// 这些域名里核实过的 email 首次登录时按 email 关联已有账号，没有就开一个
     /// （`UTOPIA_OIDC_ALLOWED_DOMAINS`）。空 = 只认本人绑定过的 subject
     allowed_domains: Vec<String>,
+    /// 授权请求要的 scope（`UTOPIA_OIDC_SCOPES`）。账号按 subject 关联，只有允许名单
+    /// 要看 email；按应用固定同意范围的租户少要一个 scope，人就不会撞上同意页
+    scopes: String,
     /// 本地开发：允许 issuer 与各端点走回环地址上的明文 HTTP。只认 localhost /
     /// 127.0.0.1 / ::1，公网地址照旧只能 HTTPS
     loopback_http: bool,
@@ -98,12 +101,36 @@ fn config() -> Result<Config, AppError> {
             .map(|d| d.trim().to_lowercase())
             .filter(|d| !d.is_empty())
             .collect(),
+        scopes: scopes(std::env::var("UTOPIA_OIDC_SCOPES").ok().as_deref()),
         loopback_http: std::env::var("UTOPIA_OIDC_ALLOW_LOOPBACK_HTTP")
             .is_ok_and(|v| matches!(v.trim(), "1" | "true")),
     };
     secure_url(&c.issuer, c.loopback_http)?;
     secure_url(&c.redirect, true)?;
     Ok(c)
+}
+
+/// 空格分隔，留空是从前写死的 `openid profile email`。没有 `openid` 就不是 OIDC 请求，
+/// 拿不到 ID token：漏写了就补在最前面，而不是让登录在回调时才莫名失败
+fn scopes(raw: Option<&str>) -> String {
+    let mut list: Vec<&str> = Vec::new();
+    for s in raw.unwrap_or_default().split_whitespace() {
+        if !list.contains(&s) {
+            list.push(s);
+        }
+    }
+    if list.is_empty() {
+        return "openid profile email".into();
+    }
+    if !list.contains(&"openid") {
+        list.insert(0, "openid");
+    }
+    list.join(" ")
+}
+
+/// 列了允许名单却不要 `email`：令牌里没有 email，名单里的人首次登录一个也关联不上
+fn scopes_miss_email(c: &Config) -> bool {
+    !c.allowed_domains.is_empty() && !c.scopes.split(' ').any(|s| s == "email")
 }
 
 fn secure_url(s: &str, loopback: bool) -> Result<reqwest::Url, AppError> {
@@ -295,6 +322,11 @@ pub fn password_login(s: &AppState) -> bool {
 /// 启动时把关掉密码登录的两种后果说出来：没配 SSO 时这个开关不生效；
 /// 没有允许名单时只有绑定过身份的人进得来，新人既注册不了也开不了户
 pub fn warn_about_password_login(s: &AppState) {
+    if config().is_ok_and(|c| scopes_miss_email(&c)) {
+        tracing::warn!(
+            "UTOPIA_OIDC_SCOPES 里没有 email，UTOPIA_OIDC_ALLOWED_DOMAINS 就关联不上任何人"
+        );
+    }
     if s.password_login {
         return;
     }
@@ -387,7 +419,7 @@ async fn begin(
     .await?;
     url.query_pairs_mut().extend_pairs([
         ("response_type", "code"),
-        ("scope", "openid profile email"),
+        ("scope", &c.scopes),
         ("client_id", &c.client_id),
         ("redirect_uri", &c.redirect),
         ("state", &state),
@@ -1099,8 +1131,35 @@ mod tests {
             redirect: "https://utopia.example.test/api/v1/auth/oidc/callback".into(),
             exchange_audiences: vec!["sibling-app".into(), "utopia-test".into()],
             allowed_domains: vec![],
+            scopes: super::scopes(None),
             loopback_http: false,
         }
+    }
+
+    #[test]
+    fn scopes_default_to_openid_profile_email_and_always_keep_openid() {
+        assert_eq!(super::scopes(None), "openid profile email");
+        assert_eq!(super::scopes(Some("  ")), "openid profile email");
+        assert_eq!(super::scopes(Some("openid profile")), "openid profile");
+        assert_eq!(super::scopes(Some(" profile  profile ")), "openid profile");
+    }
+
+    #[test]
+    fn missing_email_matters_only_with_an_allowed_domain() {
+        let without_email = super::Config {
+            scopes: super::scopes(Some("openid profile")),
+            ..config()
+        };
+        assert!(!super::scopes_miss_email(&without_email));
+        let domains = vec!["example.test".to_string()];
+        assert!(super::scopes_miss_email(&super::Config {
+            allowed_domains: domains.clone(),
+            ..without_email
+        }));
+        assert!(!super::scopes_miss_email(&super::Config {
+            allowed_domains: domains,
+            ..config()
+        }));
     }
 
     // This key is generated solely for these tests and is never used by the app.
